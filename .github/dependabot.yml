@@ -1,14 +1,53 @@
-version: 2
-updates:
-  - package-ecosystem: "pip"
-    directory: "/"
-    schedule:
-      interval: "weekly"
-  - package-ecosystem: "pip"
-    directory: "/docs/"
-    schedule:
-      interval: "weekly"
-  - package-ecosystem: "github-actions"
-    directory: "/"
-    schedule:
-      interval: "weekly"
+name: Update Go Packages and Dependencies
+
+on:
+  schedule:
+    - cron: '0 0 * * 1'  # Run weekly on Monday at 00:00 UTC
+  workflow_dispatch:  # Allow manual triggering
+
+jobs:
+  update-dependencies:
+    runs-on: ubuntu-latest
+    
+    steps:
+      - uses: actions/checkout@v3
+      
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.x'
+          
+      - name: Install Python dependency for the script
+        run: |
+          python -m pip install --upgrade pip
+          pip install requests
+          
+      - name: Update Go packages
+        run: python docker/update_go_packages.py
+        
+      - name: Check for Go package changes
+        id: go-changes
+        run: |
+          git diff --quiet || echo "changes=true" >> $GITHUB_OUTPUT
+          
+      - name: Create PR for Go package updates
+        if: steps.go-changes.outputs.changes == 'true' 
+        uses: peter-evans/create-pull-request@v5
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          commit-message: "chore: update Go package versions"
+          title: "chore: update Go package versions"
+          body: "This PR updates the Go package versions in the Dockerfile."
+          branch: "go-package-updates"
+          base: "main"
+          
+      - name: Run Dependabot
+        uses: dependabot/dependabot-core@v3
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          command: update
+          package-manager: docker
+          directory: /
+          target-branch: main
+          package-manager: pip
