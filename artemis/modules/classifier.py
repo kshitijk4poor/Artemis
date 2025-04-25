@@ -1,16 +1,40 @@
 #!/usr/bin/env python3
 import ipaddress
 import json
+import re
 import subprocess
-from typing import List, Optional
+from typing import List
 
 from karton.core import Task
 
-from artemis import load_risk_class
+from artemis import http_requests, load_risk_class
 from artemis.binds import Service, TaskStatus, TaskType
 from artemis.domains import is_domain
+from artemis.ip_utils import to_ip_range
 from artemis.module_base import ArtemisBase
-from artemis.utils import check_output_log_on_error, is_ip_address
+from artemis.utils import check_output_log_on_error
+
+ASN_REGEX = "[aA][sS][0-9][0-9]*"
+
+
+class RIPEAccessException(Exception):
+    pass
+
+
+def get_ip_prefixes_for_asn(asn: str) -> List[str]:
+    url = f"https://stat.ripe.net/data/announced-prefixes/data.json?resource={asn.upper()}"
+
+    try:
+        response = http_requests.get(url)
+        if response.status_code == 200:
+            data = response.json()
+            prefixes = [item["prefix"] for item in data["data"]["prefixes"]]
+            return prefixes
+
+        raise RIPEAccessException(f"Error connecting to RIPEstat API.\nASN: {asn}\nError code: {response.status_code}")
+    except Exception as err:
+        raise RIPEAccessException(f"Error connecting to RIPEstat API.\nASN: {asn}\nError: {err}")
+    return None
 
 
 @load_risk_class.load_risk_class(load_risk_class.LoadRiskClass.LOW)
@@ -62,7 +86,10 @@ class Classifier(ArtemisBase):
 
     @staticmethod
     def is_supported(data: str) -> bool:
-        if Classifier._to_ip_range(data):
+        if re.match(ASN_REGEX, data):
+            return True
+
+        if to_ip_range(data):
             return True
 
         data = Classifier._clean_ipv6_brackets(data)
@@ -104,32 +131,6 @@ class Classifier(ArtemisBase):
 
         raise ValueError("Failed to find domain/IP in input")
 
-    @staticmethod
-    def _to_ip_range(data: str) -> Optional[List[str]]:
-        if "-" in data:
-            start_ip_str, end_ip_str = data.split("-", 1)
-            start_ip_str = start_ip_str.strip()
-            end_ip_str = end_ip_str.strip()
-
-            if not is_ip_address(start_ip_str) or not is_ip_address(end_ip_str):
-                return None
-
-            start_ip = ipaddress.ip_address(start_ip_str)
-            end_ip = ipaddress.ip_address(end_ip_str)
-
-            cls = ipaddress.IPv6Address if ":" in data else ipaddress.IPv4Address
-            return [str(cls(i)) for i in range(int(start_ip), int(end_ip) + 1)]
-        if "/" in data:
-            ip, mask = data.split("/", 1)
-            ip = ip.strip()
-            mask = mask.strip()
-
-            if not is_ip_address(ip) or not mask.isdigit():
-                return None
-
-            return list(map(str, ipaddress.ip_network(data.strip(), strict=False)))
-        return None
-
     def run(self, current_task: Task) -> None:
         data = current_task.get_payload("data")
 
@@ -141,7 +142,7 @@ class Classifier(ArtemisBase):
             )
             return
 
-        data_as_ip_range = self._to_ip_range(data)
+        data_as_ip_range = to_ip_range(data)
         if data_as_ip_range:
             for ip in data_as_ip_range:
                 self.add_task(
@@ -153,6 +154,7 @@ class Classifier(ArtemisBase):
                         },
                         payload_persistent={
                             f"original_{TaskType.IP.value}": ip,
+                            "original_ip_range": data,
                         },
                     ),
                 )
@@ -160,6 +162,35 @@ class Classifier(ArtemisBase):
             self.db.save_task_result(
                 task=current_task, status=TaskStatus.OK, data={"type": TaskType.IP, "data": data_as_ip_range}
             )
+            return
+
+        if re.match(ASN_REGEX, data):
+            ips = []
+            for prefix in get_ip_prefixes_for_asn(data):
+                self.log.info(f"Converted {data} to IP prefixes, processing {prefix}")
+                if ":" in prefix:
+                    self.log.error(
+                        f"Skipping {prefix}, as it's an ipv6 prefix for an ASN - these might contain a large number of IPs"
+                    )
+                    continue
+
+                for ip in list(map(str, ipaddress.ip_network(prefix.strip(), strict=False))):
+                    self.add_task(
+                        current_task,
+                        Task(
+                            {"type": TaskType.IP},
+                            payload={
+                                TaskType.IP.value: ip,
+                            },
+                            payload_persistent={
+                                f"original_{TaskType.IP.value}": ip,
+                                "original_ip_range": prefix,
+                            },
+                        ),
+                    )
+                    ips.append(ip)
+
+            self.db.save_task_result(task=current_task, status=TaskStatus.OK, data={"type": TaskType.IP, "data": ips})
             return
 
         sanitized = self._sanitize(data)

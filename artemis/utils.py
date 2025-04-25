@@ -2,9 +2,8 @@ import logging
 import subprocess
 import time
 import urllib.parse
-from ipaddress import ip_address
 from pathlib import Path
-from typing import Any, Callable, List, Optional
+from typing import Any, Callable, List, Optional, Tuple
 
 from whoisdomain import Domain, WhoisQuotaExceeded  # type: ignore
 from whoisdomain import query as whois_query
@@ -28,16 +27,12 @@ class CalledProcessErrorWithMessage(subprocess.CalledProcessError):
         return self.message
 
 
-def check_output_log_on_error(
-    command: List[str], logger: logging.Logger, capture_stderr: bool = False, **kwargs: Any
-) -> bytes:
+def check_output_log_on_error_with_stderr(
+    command: List[str], logger: logging.Logger, **kwargs: Any
+) -> Tuple[bytes, bytes]:
     result = subprocess.run(command, capture_output=True, **kwargs)
     if result.returncode == 0:
-        out: bytes = result.stdout
-        if capture_stderr:
-            # This is to keep the streams separate, not interleaved, in case a downstream tool attempts to parse them
-            out += b"\n" + result.stderr
-        return out
+        return (result.stdout, result.stderr)
     else:
         command_str_shortened = repr(command)
         if len(command_str_shortened) > 100:
@@ -53,6 +48,11 @@ def check_output_log_on_error(
         raise CalledProcessErrorWithMessage(
             message=message, returncode=result.returncode, cmd=command, output=result.stdout, stderr=result.stderr
         )
+
+
+def check_output_log_on_error(command: List[str], logger: logging.Logger, **kwargs: Any) -> bytes:
+    stdout, stderr = check_output_log_on_error_with_stderr(command, logger, **kwargs)
+    return stdout
 
 
 def perform_whois_or_sleep(domain: str, logger: logging.Logger) -> Optional[Domain]:
@@ -112,15 +112,6 @@ def get_host_from_url(url: str) -> str:
     host = urllib.parse.urlparse(url).hostname
     assert host is not None
     return host
-
-
-def is_ip_address(host: str) -> bool:
-    try:
-        # if this doesn't throw then we have an IP address
-        ip_address(host)
-        return True
-    except ValueError:
-        return False
 
 
 def read_template(path: str) -> str:

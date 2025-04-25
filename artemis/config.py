@@ -1,5 +1,5 @@
 import os
-from typing import Annotated, Any, List, get_type_hints
+from typing import Annotated, Any, List, Optional, get_type_hints
 
 import decouple
 
@@ -28,6 +28,13 @@ class Config:
         )
         REDIS_CONN_STR: Annotated[str, "Connection string to Redis."] = get_config("REDIS_CONN_STR")
 
+        SAVE_LOGS_IN_DATABASE: Annotated[
+            bool,
+            """
+            Whether Artemis should save task logs in the database to be viewed in the UI. Turn it off to save space in the databaee.
+            """,
+        ] = get_config("SAVE_LOGS_IN_DATABASE", default=True, cast=bool)
+
         LEGACY_MONGODB_CONN_STR: Annotated[
             str,
             "Connection string to the MongoDB database. MongoDB is not used anymore - it is present here to seamlessly "
@@ -41,7 +48,7 @@ class Config:
             AUTOARCHIVER_MIN_AGE_SECONDS: Annotated[
                 int, "How old the task results need to be to be archived (in seconds)"
             ] = get_config(
-                "AUTOARCHIVER_MIN_AGE_SECONDS", default=80 * 24 * 60 * 60, cast=int
+                "AUTOARCHIVER_MIN_AGE_SECONDS", default=120 * 24 * 60 * 60, cast=int
             )  # 80 days
             AUTOARCHIVER_PACK_SIZE: Annotated[
                 int,
@@ -55,7 +62,7 @@ class Config:
     class Reporting:
         REPORTING_MAX_VULN_AGE_DAYS: Annotated[
             int, "When creating e-mail reports, what is the vulnerability maximum age (in days) for it to be reported."
-        ] = get_config("REPORTING_MAX_VULN_AGE_DAYS", default=60, cast=int)
+        ] = get_config("REPORTING_MAX_VULN_AGE_DAYS", default=120, cast=int)
 
         REPORTING_SEPARATE_INSTITUTIONS: Annotated[
             List[str],
@@ -158,13 +165,18 @@ class Config:
 
     class Limits:
         TASK_TIMEOUT_SECONDS: Annotated[int, "What is the maximum task run time (after which it will get killed)."] = (
-            get_config("TASK_TIMEOUT_SECONDS", default=6 * 3600, cast=int)
+            get_config("TASK_TIMEOUT_SECONDS", default=12 * 3600, cast=int)
         )
 
         REQUEST_TIMEOUT_SECONDS: Annotated[
             int,
             "Default request timeout (for all protocols).",
         ] = get_config("REQUEST_TIMEOUT_SECONDS", default=5, cast=int)
+
+        SCAN_SPEED_OVERRIDES_FILE: Annotated[
+            Optional[str],
+            "A JSON file with a dictionary mapping from IP to scan speed - use if you want to slow down scanning of particular hosts.",
+        ] = get_config("SCAN_SPEED_OVERRIDES_FILE", default="", cast=str)
 
         REQUESTS_PER_SECOND: Annotated[
             float,
@@ -181,6 +193,11 @@ class Config:
         REMOVE_LOGS_AFTER_DAYS: Annotated[int, "After what number of days the logs in karton-logs are removed."] = (
             get_config("REMOVE_LOGS_AFTER_DAYS", default=30)
         )
+
+        STOP_SCANNING_MODULES_IF_FREE_DISK_SPACE_LOWER_THAN_MB: Annotated[
+            int,
+            "If free disk space on / becomes lower than this value, scanning will stop so that we don't end up being unable to save the results.",
+        ] = get_config("STOP_SCANNING_MODULES_IF_FREE_DISK_SPACE_LOWER_THAN_MB", default=1000)
 
         BLOCKLIST_FILE: Annotated[
             str,
@@ -206,6 +223,18 @@ class Config:
             "LOGGING_FORMAT_STRING",
             default="[%(levelname)s] - [%(asctime)s] %(filename)s - in %(funcName)s() (line %(lineno)d): %(message)s",
         )
+
+        PASSWORD_BRUTER_ADDITIONAL_PASSWORDS: Annotated[
+            List[str], "Additional passwords (besides the top10 ones) to be used in brute forcing."
+        ] = get_config("PASSWORD_BRUTER_ADDITIONAL_PASSWORDS", default="", cast=decouple.Csv(str))
+
+        STRIPPED_PREFIXES: Annotated[
+            List[str],
+            "Some password bruters extracts the site name to brute-force passwords. For example, if it observes "
+            "projectname.example.com it will bruteforce projectname123, projectname2023, ... "
+            "This list describes what domain prefixes to strip (e.g. www) so that we bruteforce projectname123, not "
+            "www123, when testing www.projectname.example.com.",
+        ] = get_config("STRIPPED_PREFIXES", default="www", cast=decouple.Csv(str))
 
         VERIFY_REVDNS_IN_SCOPE: Annotated[
             bool,
@@ -234,7 +263,7 @@ class Config:
             int,
             "After this number of tasks processed, each scanning module will get restarted. This is to prevent situations "
             "such as slow memory leaks.",
-        ] = get_config("MAX_NUM_TASKS_TO_PROCESS", default=200, cast=int)
+        ] = get_config("MAX_NUM_TASKS_TO_PROCESS", default=1000, cast=int)
 
         CONTENT_PREFIX_SIZE: Annotated[
             int,
@@ -245,7 +274,9 @@ class Config:
             List[str],
             "Artemis modules that are disabled by default (but may easily be enabled in the UI)",
         ] = get_config(
-            "MODULES_DISABLED_BY_DEFAULT", default="example,humble,ssh_bruter", cast=decouple.Csv(str, delimiter=",")
+            "MODULES_DISABLED_BY_DEFAULT",
+            default="admin_panel_login_bruter,example,humble,ssh_bruter",
+            cast=decouple.Csv(str, delimiter=","),
         )
 
         SUBDOMAIN_ENUMERATION_TTL_DAYS: Annotated[
@@ -255,7 +286,22 @@ class Config:
             "in SUBDOMAIN_ENUMERATION_TTL_DAYS days. This is the TTL of such markers.",
         ] = get_config("SUBDOMAIN_ENUMERATION_TTL_DAYS", default=10, cast=int)
 
+        ADDITIONAL_HOSTS_FILE_PATH: Annotated[str, "File that will be appended to /etc/hosts"] = get_config(
+            "ADDITIONAL_HOSTS_FILE_PATH", default="", cast=str
+        )
+
+        MAX_URLS_TO_SCAN: Annotated[
+            int,
+            "Maximum number of URLs to scan per target for modules that crawl like lfi_detector, Nuclei, sq_injection_detector, etc.",
+        ] = get_config("MAX_URLS_TO_SCAN", default=25, cast=int)
+
     class Modules:
+        class AdminPanelLoginBruter:
+            ADMIN_PANEL_LOGIN_BRUTER_NUM_RECHECKS: Annotated[
+                int,
+                "How many times to recheck whether the good password works, and the bad doesn't",
+            ] = get_config("ADMIN_PANEL_LOGIN_BRUTER_NUM_RECHECKS", default=5, cast=int)
+
         class Bruter:
             BRUTER_FILE_LIST: Annotated[
                 str,
@@ -420,6 +466,7 @@ class Config:
                         "http/exposed-panels/checkpoint/ssl-network-extender.yaml",
                         "http/exposed-panels/pulse-secure-panel.yaml",
                         "http/exposed-panels/pulse-secure-version.yaml",
+                        "http/exposed-panels/cisco/cisco-asa-panel.yaml",
                         "http/exposed-panels/cisco/cisco-anyconnect-vpn.yaml",
                         "http/exposed-panels/openvpn-connect.yaml",
                         "http/exposed-panels/ivanti-csa-panel.yaml",
@@ -454,6 +501,9 @@ class Config:
                         "http/exposed-panels/rocketchat-panel.yaml",
                         # Source of FPs
                         "custom:CVE-2019-1579",
+                        "custom:CVE-2024-35286",
+                        "custom:CVE-2022-43939",
+                        "custom:CVE-2025-24016",
                         "custom:xss-inside-tag-top-params.yaml",
                         # Nothing particularily interesting
                         "http/exposures/apis/drupal-jsonapi-user-listing.yaml",
@@ -615,6 +665,7 @@ class Config:
                         "http/miscellaneous/defaced-website-detect.yaml",
                         "http/misconfiguration/google/insecure-firebase-database.yaml",
                         "custom:CVE-2024-4836",
+                        "custom:CVE-2024-35286",
                         # Until https://github.com/projectdiscovery/nuclei-templates/issues/8657
                         # gets fixed, these templates return a FP on phpinfo(). Let's not spam
                         # our recipients with FPs.
@@ -636,24 +687,30 @@ class Config:
                         "http/cves/2012/CVE-2012-4889.yaml",
                         "http/cves/2014/CVE-2014-2908.yaml",
                         "http/cves/2014/CVE-2014-9444.yaml",
+                        "http/cves/2015/CVE-2015-3035.yaml",
                         "http/cves/2015/CVE-2015-5354.yaml",
+                        "http/cves/2018/CVE-2018-6184.yaml",
                         "http/cves/2015/CVE-2015-8349.yaml",
                         "http/cves/2016/CVE-2016-7981.yaml",
                         "http/cves/2016/CVE-2016-8527.yaml",
                         "http/cves/2017/CVE-2017-12794.yaml",
                         "http/cves/2018/CVE-2018-8006.yaml",
+                        "http/cves/2018/CVE-2018-10956.yaml",
                         "http/cves/2018/CVE-2018-11709.yaml",
                         "http/cves/2018/CVE-2018-12095.yaml",
                         "http/cves/2018/CVE-2018-12998.yaml",
                         "http/cves/2018/CVE-2018-13380.yaml",
                         "http/cves/2018/CVE-2018-14013.yaml",
+                        "http/cves/2018/CVE-2018-16836.yaml",
                         "http/cves/2018/CVE-2018-18570.yaml",
                         "http/cves/2019/CVE-2019-10098.yaml",
+                        "http/cves/2019/CVE-2019-18922.yaml",
                         "http/cves/2019/CVE-2019-3911.yaml",
                         "http/cves/2019/CVE-2019-7219.yaml",
                         "http/cves/2019/CVE-2019-7315.yaml",
                         "http/cves/2019/CVE-2019-7543.yaml",
                         "http/cves/2019/CVE-2019-10475.yaml",
+                        "http/cves/2019/CVE-2019-11510.yaml",
                         "http/cves/2019/CVE-2019-12461.yaml",
                         "http/cves/2019/CVE-2019-13392.yaml",
                         "http/cves/2020/CVE-2020-1943.yaml",
@@ -678,7 +735,10 @@ class Config:
                         "http/cves/2021/CVE-2021-31250.yaml",
                         "http/cves/2021/CVE-2021-38702.yaml",
                         "http/cves/2021/CVE-2021-40868.yaml",
+                        "http/cves/2021/CVE-2021-40960.yaml",
+                        "http/cves/2021/CVE-2021-40978.yaml",
                         "http/cves/2021/CVE-2021-41467.yaml",
+                        "http/cves/2021/CVE-2021-41773.yaml",
                         "http/cves/2021/CVE-2021-42565.yaml",
                         "http/cves/2021/CVE-2021-42566.yaml",
                         "http/cves/2021/CVE-2021-43831.yaml",
@@ -688,6 +748,7 @@ class Config:
                         "http/cves/2023/CVE-2023-43373.yaml",
                         "http/cves/2023/CVE-2023-43374.yaml",
                         "http/cves/2023/CVE-2023-47684.yaml",
+                        "http/iot/targa-camera-lfi.yaml",
                         "http/vulnerabilities/ibm/eclipse-help-system-xss.yaml",
                         "http/vulnerabilities/ibm/ibm-infoprint-lfi.yaml",
                         "http/vulnerabilities/other/bullwark-momentum-lfi.yaml",
@@ -707,6 +768,7 @@ class Config:
                         "http/vulnerabilities/other/turbocrm-xss.yaml",
                         "http/vulnerabilities/other/wems-manager-xss.yaml",
                         "http/vulnerabilities/wordpress/wp-touch-redirect.yaml",
+                        "http/fuzzing/iis-shortname.yaml",
                     ]
                 ),
                 cast=decouple.Csv(str),
@@ -736,13 +798,13 @@ class Config:
                 "Maximum number of links to be checked with the templates provided in "
                 "NUCLEI_TEMPLATES_TO_RUN_ON_HOMEPAGE_LINKS (if more are seen, random "
                 "NUCLEI_MAX_NUM_LINKS_TO_PROCESS are chosen).",
-            ] = get_config("NUCLEI_MAX_NUM_LINKS_TO_PROCESS", default=100, cast=int)
+            ] = get_config("NUCLEI_MAX_NUM_LINKS_TO_PROCESS", default=20, cast=int)
 
-            NUCLEI_TEMPLATE_CHUNK_SIZE: Annotated[
+            NUCLEI_CHUNK_SIZE: Annotated[
                 int,
-                "How big are the chunks to split the template list. E.g. if the template list contains 600 templates and "
-                "NUCLEI_TEMPLATE_CHUNK_SIZE is 200, three calls will be made with 200 templates each.",
-            ] = get_config("NUCLEI_TEMPLATE_CHUNK_SIZE", default=200, cast=int)
+                "How big are the chunks to split the template/workflow list. E.g. if the template list contains 600 templates and "
+                "NUCLEI_CHUNK_SIZE is 200, three calls will be made with 200 templates each.",
+            ] = get_config("NUCLEI_CHUNK_SIZE", default=200, cast=int)
 
         class PlaceholderPageContent:
             ENABLE_PLACEHOLDER_PAGE_DETECTOR: Annotated[
@@ -776,10 +838,26 @@ class Config:
                 "Custom port list to scan in CSV form (replaces default list).",
             ] = get_config("CUSTOM_PORT_SCANNER_PORTS", default="", cast=decouple.Csv(int))
 
+            ADD_PORTS_FROM_SHODAN_INTERNETDB: Annotated[
+                bool,
+                "Besides the scanned ports (configured by PORT_SCANNER_PORT_LIST and CUSTOM_PORT_SCANNER_PORTS), "
+                "add ports from internetdb.shodan.io. "
+                "By using this source you confirm that you have read carefully the terms and conditions on "
+                "https://internetdb.shodan.io/ and agree to respect them, in particular in ensuring no conflict "
+                "with the commercialization clause. For the avoidance of doubt, in any case, you remain solely "
+                "liable for how you use this source and your compliance with the terms, and NASK is relieved of "
+                "such liability to the fullest extent possible.",
+            ] = get_config("ADD_PORTS_FROM_SHODAN_INTERNETDB", default=False, cast=bool)
+
             PORT_SCANNER_TIMEOUT_MILLISECONDS: Annotated[
                 int,
                 "Port scanner: milliseconds to wait before timing out",
             ] = get_config("PORT_SCANNER_TIMEOUT_MILLISECONDS", default=5_000, cast=int)
+
+            PORT_SCANNER_MAX_BATCH_SIZE: Annotated[
+                int,
+                "Port scanner: number of hosts scanned by one port_scanner instance",
+            ] = get_config("PORT_SCANNER_MAX_BATCH_SIZE", default=10, cast=int)
 
             PORT_SCANNER_MAX_NUM_PORTS: Annotated[
                 int,
@@ -823,6 +901,17 @@ class Config:
                 "doesn't host the given domain.",
             ] = get_config("REMOVED_DOMAIN_EXISTING_VHOST_SIMILARITY_THRESHOLD", default=0.5, cast=float)
 
+        class ReverseDNSLookup:
+            REVERSE_DNS_APIS: Annotated[
+                List[str],
+                "List of URLs (such as e.g. https://internetdb.shodan.io/) that provide a JSON dictionary with 'hostnames' field for an IP. "
+                "By using this source you confirm that you have read carefully the terms and conditions on "
+                "https://internetdb.shodan.io/ and agree to respect them, in particular in ensuring no conflict "
+                "with the commercialization clause. For the avoidance of doubt, in any case, you remain solely "
+                "liable for how you use this source and your compliance with the terms, and NASK is relieved of "
+                "such liability to the fullest extent possible.",
+            ] = get_config("REVERSE_DNS_APIS", default="", cast=decouple.Csv(str))
+
         class Shodan:
             SHODAN_API_KEY: Annotated[
                 str,
@@ -841,6 +930,16 @@ class Config:
                 int,
                 "Number of retries for subdomain enumeration.",
             ] = get_config("SUBDOMAIN_ENUMERATION_RETRIES", default=10, cast=int)
+
+            DNS_BRUTE_FORCE_TIME_LIMIT_SECONDS: Annotated[
+                int,
+                "Time limit for DNS brute force in seconds - some of the servers are very slow, so we don't want to wait too long.",
+            ] = get_config("DNS_BRUTE_FORCE_TIME_LIMIT_SECONDS", default=1200, cast=int)
+
+            DNS_QUERIES_PER_SECOND: Annotated[
+                int,
+                "Number of DNS queries per second (as they are easier to handle than e.g. HTTP queries, let's have a separate limit)",
+            ] = get_config("DNS_QUERIES_PER_SECOND", default=20, cast=int)
 
             SLEEP_TIME_SECONDS: Annotated[
                 int,
@@ -878,15 +977,6 @@ class Config:
                 'mean "insecure" here.',
             ] = get_config("WORDPRESS_VERSION_AGE_DAYS", default=90, cast=int)
 
-        class WordPressBruter:
-            WORDPRESS_BRUTER_STRIPPED_PREFIXES: Annotated[
-                List[str],
-                "Wordpress_bruter extracts the site name to brute-force passwords. For example, if it observes "
-                "projectname.example.com it will bruteforce projectname123, projectname2023, ... "
-                "This list describes what domain prefixes to strip (e.g. www) so that we bruteforce projectname123, not "
-                "www123, when testing www.projectname.example.com.",
-            ] = get_config("WORDPRESS_BRUTER_STRIPPED_PREFIXES", default="www", cast=decouple.Csv(str))
-
         class DomainExpirationScanner:
             DOMAIN_EXPIRATION_TIMEFRAME_DAYS: Annotated[
                 int, "The scanner warns if the domain's expiration date falls within this time frame from now."
@@ -905,6 +995,12 @@ class Config:
                 int,
                 "Seconds to sleep using the sleep() or pg_sleep() methods",
             ] = get_config("SQL_INJECTION_TIME_THRESHOLD", default=5, cast=int)
+
+        class LFIDetector:
+            LFI_STOP_ON_FIRST_MATCH: Annotated[
+                bool,
+                "Whether to display only the first LFI and stop scanning.",
+            ] = get_config("LFI_STOP_ON_FIRST_MATCH", default=True, cast=bool)
 
     @staticmethod
     def verify_each_variable_is_annotated() -> None:

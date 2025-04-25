@@ -1,12 +1,15 @@
 import datetime
+import fcntl
+import json
 import logging
 import random
+import shutil
 import sys
 import time
 import traceback
 import urllib.parse
 from ipaddress import ip_address
-from typing import Any, Callable, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import timeout_decorator
 from karton.core import Karton, Task
@@ -16,11 +19,13 @@ from redis import Redis
 from requests.exceptions import RequestException
 
 from artemis import http_requests
-from artemis.binds import TaskStatus, TaskType
+from artemis.binds import Service, TaskStatus, TaskType
 from artemis.blocklist import load_blocklist, should_block_scanning
 from artemis.config import Config
 from artemis.db import DB
 from artemis.domains import is_domain
+from artemis.ip_utils import is_ip_address
+from artemis.output_redirector import OutputRedirector
 from artemis.placeholder_page_detector import PlaceholderPageDetector
 from artemis.redis_cache import RedisCache
 from artemis.resolvers import NoAnswer, ResolutionException, lookup
@@ -32,7 +37,7 @@ from artemis.task_utils import (
     increase_analysis_num_finished_tasks,
     increase_analysis_num_in_progress_tasks,
 )
-from artemis.utils import is_ip_address, throttle_request
+from artemis.utils import throttle_request
 
 REDIS = Redis.from_url(Config.Data.REDIS_CONN_STR)
 
@@ -67,12 +72,14 @@ class ArtemisBase(Karton):
     # Sometimes the task queue is very long and e.g. the first n tasks can't be taken because they concern IPs that
     # are already scanned. To make scanning faster, Artemis remembers the position in the task queue for the next
     # QUEUE_LOCATION_MAX_AGE_SECONDS in order not to repeat trying to lock the first tasks in the queue.
-    queue_id: int = 0
-    queue_position: int = 0
-    queue_location_timestamp: float = 0
     queue_location_max_age_seconds: int = Config.Locking.QUEUE_LOCATION_MAX_AGE_SECONDS
 
     requests_per_second_for_current_tasks: float = Config.Limits.REQUESTS_PER_SECOND
+
+    # Sometimes a module needs to make a large number of HTTP requests and a small number of failures is OK.
+    # These two counters control that. To use the feature use self.forgiving_http_get or self.forgiving_http_post
+    _forgiven_http_requests: int = 0
+    _forgiven_http_requests_max: int = 10
 
     def __init__(self, db: Optional[DB] = None, *args, **kwargs) -> None:  # type: ignore[no-untyped-def]
         super().__init__(*args, **kwargs)
@@ -81,6 +88,19 @@ class ArtemisBase(Karton):
         self.setup_logger(Config.Miscellaneous.LOG_LEVEL)
         self.taking_tasks_from_queue_lock = ResourceLock(res_name=f"taking-tasks-from-queue-{self.identity}")
         self.redis = REDIS
+
+        if Config.Miscellaneous.ADDITIONAL_HOSTS_FILE_PATH:
+            with open(Config.Miscellaneous.ADDITIONAL_HOSTS_FILE_PATH, "r") as additional_data_file:
+                with open("/etc/hosts", "a") as hosts_file:
+                    fcntl.flock(hosts_file.fileno(), fcntl.LOCK_EX)
+                    hosts_file.write(additional_data_file.read())
+                    fcntl.flock(hosts_file.fileno(), fcntl.LOCK_UN)
+
+        if Config.Limits.SCAN_SPEED_OVERRIDES_FILE:
+            with open(Config.Limits.SCAN_SPEED_OVERRIDES_FILE, "r") as f:
+                self._scan_speed_overrides: Dict[str, float] = json.load(f)
+        else:
+            self._scan_speed_overrides = {}
 
         if Config.Miscellaneous.BLOCKLIST_FILE:
             self._blocklist = load_blocklist(Config.Miscellaneous.BLOCKLIST_FILE)
@@ -171,7 +191,7 @@ class ArtemisBase(Karton):
 
     def check_domain_exists(self, domain: str) -> bool:
         """
-        Check if a domain exists by looking up its NS and A records.
+        Check if a domain exists by looking up its DNS records.
 
         Args:
             domain (str): The domain to check.
@@ -180,19 +200,16 @@ class ArtemisBase(Karton):
             bool: True if the domain exists, False otherwise.
         """
         try:
+            # Don't check NS, as a domain that has only NS is not worth scanning
+            for record_type in ["A", "AAAA", "MX"]:
+                try:
+                    records = lookup(domain, record_type)
+                    if records:
+                        return True
+                except NoAnswer:
+                    pass
 
-            # Check for NS records
-            try:
-                ns_records = lookup(domain, "NS")
-                if ns_records:
-                    return True
-            except NoAnswer:
-                # No NS records, continue to check A records
-                pass
-
-            # Check for A records
-            a_records = lookup(domain, "A")
-            return len(a_records) > 0  # returns true if found
+            return False
 
         except ResolutionException:
             return False
@@ -241,6 +258,16 @@ class ArtemisBase(Karton):
     def _single_iteration(self) -> int:
         self.log.debug("single iteration")
 
+        _, _, free_disk_space = shutil.disk_usage("/")
+        if free_disk_space < 1024 * 1024 * Config.Miscellaneous.STOP_SCANNING_MODULES_IF_FREE_DISK_SPACE_LOWER_THAN_MB:
+            self.log.error(
+                "Stopping scanning as disk space is lower than %s MB (it's %s MB)",
+                Config.Miscellaneous.STOP_SCANNING_MODULES_IF_FREE_DISK_SPACE_LOWER_THAN_MB,
+                free_disk_space / (1024 * 1024),
+            )
+            self._shutdown = True
+            return 0
+
         # In case there was a problem and previous locks was not released
         ResourceLock.release_all_locks(self.log)
 
@@ -271,12 +298,17 @@ class ArtemisBase(Karton):
             if "requests_per_second_override" in task.payload_persistent
         ]
 
+        for task in tasks:
+            destination = self._get_scan_destination(task)
+            if destination in self._scan_speed_overrides:
+                requests_per_second_overrides.append(self._scan_speed_overrides[destination])
+
         self.requests_per_second_for_current_tasks = min(  # type: ignore
             requests_per_second_overrides if requests_per_second_overrides else [Config.Limits.REQUESTS_PER_SECOND]
         )
 
         if requests_per_second_overrides:
-            self.log.info("Overriding requests per second to %f", self.requests_per_second_for_current_tasks)
+            self.log.info("Setting requests per second to %f", self.requests_per_second_for_current_tasks)
 
         if len(tasks):
             time_start = time.time()
@@ -313,26 +345,31 @@ class ArtemisBase(Karton):
             tasks = []
             locks: List[Optional[ResourceLock]] = []
 
-            if self.queue_location_timestamp < time.time() - self.queue_location_max_age_seconds:
-                self.queue_id = 0
-                self.queue_position = 0
-                self.queue_location_timestamp = time.time()
+            if (
+                float(REDIS.get(f"queue_location_timestamp-{self.identity}") or 0)
+                < time.time() - self.queue_location_max_age_seconds
+            ):
+                REDIS.set(f"queue_id-{self.identity}", 0)
+                REDIS.set(f"queue_position-{self.identity}", 0)
+                REDIS.set(f"queue_location_timestamp-{self.identity}", time.time())
 
-            for i, queue in list(enumerate(self.backend.get_queue_names(self.identity)))[self.queue_id :]:
-                if i > self.queue_id:
-                    self.queue_position = 0
+            queue_id = int(REDIS.get(f"queue_id-{self.identity}") or 0)
 
-                original_queue_position = self.queue_position
+            for i, queue in list(enumerate(self.backend.get_queue_names(self.identity)))[queue_id:]:
+                if i > queue_id:
+                    REDIS.set(f"queue_position-{self.identity}", 0)
+
+                original_queue_position = int(REDIS.get(f"queue_position-{self.identity}") or 0)
                 self.log.debug(f"[taking tasks] Taking tasks from queue {queue} from task {original_queue_position}")
                 if self.lock_target:
-                    self.queue_id = i
+                    REDIS.set(f"queue_id-{self.identity}", i)
                 for i_from_queue_position, item in enumerate(
                     self.backend.redis.lrange(queue, original_queue_position, -1)
                 ):
                     i = i_from_queue_position + original_queue_position
 
                     if self.lock_target:
-                        self.queue_position = i
+                        REDIS.set(f"queue_position-{self.identity}", i)
 
                     task = self.backend.get_task(item)
 
@@ -384,6 +421,11 @@ class ArtemisBase(Karton):
                 self.log.debug(f"[taking tasks] {len(tasks)} tasks after checking queue {queue}")
                 if len(tasks) >= num_tasks:
                     break
+
+            if len(tasks) < num_tasks:
+                REDIS.set(f"queue_id-{self.identity}", 0)
+                REDIS.set(f"queue_position-{self.identity}", 0)
+                REDIS.set(f"queue_location_timestamp-{self.identity}", time.time())
         except Exception:
             for already_acquired_lock in locks:
                 if already_acquired_lock:
@@ -392,10 +434,6 @@ class ArtemisBase(Karton):
         finally:
             self.taking_tasks_from_queue_lock.release()
 
-        if len(tasks) < num_tasks:
-            self.queue_id = 0
-            self.queue_position = 0
-            self.queue_location_timestamp = time.time()
         self.log.debug("[taking tasks] Tasks from queue taken")
 
         tasks_not_blocklisted = []
@@ -521,16 +559,41 @@ class ArtemisBase(Karton):
         if len(tasks) == 0:
             return
 
+        self._forgiven_http_requests = 0
+        output_redirector = OutputRedirector()
+
+        tasks_filtered = []
+        for task in tasks:
+            should_check_connection = False
+            if task.headers["type"] == TaskType.SERVICE and task.headers["service"] == Service.HTTP:
+                should_check_connection = True
+            elif task.headers["type"] == TaskType.WEBAPP:
+                should_check_connection = True
+            elif task.headers["type"] == TaskType.URL:
+                should_check_connection = True
+
+            if not should_check_connection or self.check_connection_to_base_url_and_save_error(task):
+                tasks_filtered.append(task)
+
+        tasks = tasks_filtered
+        if not tasks:
+            return
+
         try:
-            if self.batch_tasks:
-                timeout_decorator.timeout(self.timeout_seconds)(lambda: self.run_multiple(tasks))()
-            else:
-                (task,) = tasks
-                timeout_decorator.timeout(self.timeout_seconds)(lambda: self.run(task))()
+            with output_redirector:
+                if self.batch_tasks:
+                    timeout_decorator.timeout(self.timeout_seconds)(lambda: self.run_multiple(tasks))()
+                else:
+                    (task,) = tasks
+                    timeout_decorator.timeout(self.timeout_seconds)(lambda: self.run(task))()
         except Exception:
             for task in tasks:
                 self.db.save_task_result(task=task, status=TaskStatus.ERROR, data=traceback.format_exc())
             raise
+        finally:
+            if Config.Data.SAVE_LOGS_IN_DATABASE:
+                for task in tasks:
+                    self.db.save_task_logs(task.uid, output_redirector.get_output())
 
     def _log_tasks(self, tasks: List[Task]) -> None:
         if not tasks:
@@ -633,9 +696,11 @@ class ArtemisBase(Karton):
                         "Cloudflare</title>",
                         "<hr><center>cloudflare</center>",
                         "Incapsula incident ID",
+                        'script src="/_Incapsula_Resource',
                         "Please wait while your request is being verified...",
                         "<title>Unauthorized Access</title>",
                         "<title>Attack Detected</title>",
+                        "<h1>You have been blocked</h1></html>",
                     ]
                 ]
             ):
@@ -643,6 +708,7 @@ class ArtemisBase(Karton):
                     task=task,
                     status=TaskStatus.ERROR,
                     status_reason=f"Unable to connect to base URL: {base_url}: WAF detected, task skipped",
+                    data={"waf_detected": True},
                 )
                 self.log.info(
                     f"Unable to connect to base URL: {base_url}: WAF detected, task skipped, releasing lock for {scan_destination}"
@@ -664,12 +730,30 @@ class ArtemisBase(Karton):
             return False
 
     def http_get(self, *args, **kwargs) -> http_requests.HTTPResponse:  # type: ignore
-        kwargs["requests_per_second"] = self.requests_per_second_for_current_tasks
-        return http_requests.get(*args, **kwargs)
+        return self._http_request("get", *args, **kwargs)
 
     def http_post(self, *args, **kwargs) -> http_requests.HTTPResponse:  # type: ignore
+        return self._http_request("post", *args, **kwargs)
+
+    # Sometimes a module needs to make a large number of HTTP requests and a small number of failures is OK.
+    # These two methods allow to do that.
+    def forgiving_http_get(self, *args, **kwargs) -> Optional[http_requests.HTTPResponse]:  # type: ignore
+        return self._forgiving_http_request("get", *args, **kwargs)
+
+    def forgiving_http_post(self, *args, **kwargs) -> Optional[http_requests.HTTPResponse]:  # type: ignore
+        return self._forgiving_http_request("post", *args, **kwargs)
+
+    def _forgiving_http_request(self, method: str, *args, **kwargs) -> Optional[http_requests.HTTPResponse]:  # type: ignore
+        try:
+            return self._http_request(method, *args, **kwargs)
+        except Exception:
+            self._forgiven_http_requests += 1
+            if self._forgiven_http_requests > self._forgiven_http_requests_max:
+                raise
+
+    def _http_request(self, method: str, *args, **kwargs) -> http_requests.HTTPResponse:  # type: ignore
         kwargs["requests_per_second"] = self.requests_per_second_for_current_tasks
-        return http_requests.post(*args, **kwargs)
+        return getattr(http_requests, method)(*args, **kwargs)  # type: ignore
 
     def throttle_request(self, f: Callable[[], Any]) -> Any:
         return throttle_request(f, requests_per_second=self.requests_per_second_for_current_tasks)
