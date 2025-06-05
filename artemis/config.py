@@ -275,7 +275,7 @@ class Config:
             "Artemis modules that are disabled by default (but may easily be enabled in the UI)",
         ] = get_config(
             "MODULES_DISABLED_BY_DEFAULT",
-            default="admin_panel_login_bruter,example,humble,ssh_bruter",
+            default="admin_panel_login_bruter,example,humble,ssh_bruter,moodle_scanner",
             cast=decouple.Csv(str, delimiter=","),
         )
 
@@ -300,7 +300,7 @@ class Config:
             ADMIN_PANEL_LOGIN_BRUTER_NUM_RECHECKS: Annotated[
                 int,
                 "How many times to recheck whether the good password works, and the bad doesn't",
-            ] = get_config("ADMIN_PANEL_LOGIN_BRUTER_NUM_RECHECKS", default=5, cast=int)
+            ] = get_config("ADMIN_PANEL_LOGIN_BRUTER_NUM_RECHECKS", default=10, cast=int)
 
         class Bruter:
             BRUTER_FILE_LIST: Annotated[
@@ -629,6 +629,7 @@ class Config:
                         "http/exposures/logs/roundcube-log-disclosure.yaml",
                         "network/detection/rtsp-detect.yaml",
                         "http/miscellaneous/defaced-website-detect.yaml",
+                        "http/miscellaneous/http-trace.yaml",
                         "http/misconfiguration/directory-listing-no-host-header.yaml",
                         "http/misconfiguration/django-debug-detect.yaml",
                         "http/misconfiguration/mixed-active-content.yaml",
@@ -748,6 +749,7 @@ class Config:
                         "http/cves/2023/CVE-2023-43373.yaml",
                         "http/cves/2023/CVE-2023-43374.yaml",
                         "http/cves/2023/CVE-2023-47684.yaml",
+                        "http/cves/2025/CVE-2025-24813.yaml",
                         "http/iot/targa-camera-lfi.yaml",
                         "http/vulnerabilities/ibm/eclipse-help-system-xss.yaml",
                         "http/vulnerabilities/ibm/ibm-infoprint-lfi.yaml",
